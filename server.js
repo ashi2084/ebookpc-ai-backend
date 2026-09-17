@@ -42,17 +42,29 @@ If you are unsure, say so honestly.
 });
 
 /* -------------------------------------------------------
-   Helper: fetch JSON
+   Helper: fetch JSON safely
 ------------------------------------------------------- */
 
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, options);
+  const contentType = response.headers.get("content-type") || "";
+  const body = await response.text();
 
   if (!response.ok) {
     throw new Error(`Request failed with status ${response.status}`);
   }
 
-  return await response.json();
+  if (!contentType.toLowerCase().includes("json")) {
+    throw new Error(
+      `Expected JSON but received ${contentType || "unknown content type"}`
+    );
+  }
+
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new Error("The external service returned invalid JSON.");
+  }
 }
 
 /* -------------------------------------------------------
@@ -61,7 +73,6 @@ async function fetchJson(url, options = {}) {
 
 function distanceMiles(lat1, lon1, lat2, lon2) {
   const toRadians = (value) => (value * Math.PI) / 180;
-
   const earthRadiusMiles = 3958.7613;
 
   const dLat = toRadians(lat2 - lat1);
@@ -76,6 +87,92 @@ function distanceMiles(lat1, lon1, lat2, lon2) {
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
   return earthRadiusMiles * c;
+}
+
+/* -------------------------------------------------------
+   Helper: find coordinates for a US ZIP + area
+------------------------------------------------------- */
+
+async function geocodeUSLocation(area, zipCode) {
+  const query = `${area}, ${zipCode}, USA`;
+
+  const url =
+    "https://nominatim.openstreetmap.org/search?" +
+    new URLSearchParams({
+      q: query,
+      format: "jsonv2",
+      addressdetails: "1",
+      limit: "1",
+      countrycodes: "us"
+    }).toString();
+
+  const data = await fetchJson(url, {
+    headers: {
+      "User-Agent": "EbookPc/1.0 (EbookPc safety resources)"
+    }
+  });
+
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error("Location could not be found.");
+  }
+
+  const latitude = Number(data[0].lat);
+  const longitude = Number(data[0].lon);
+
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    throw new Error("Location coordinates are invalid.");
+  }
+
+  return { latitude, longitude };
+}
+
+/* -------------------------------------------------------
+   Helper: query a public Overpass instance
+------------------------------------------------------- */
+
+async function getPoliceFromOverpass(endpoint, latitude, longitude) {
+  const overpassQuery = `
+[out:json][timeout:25];
+(
+  nwr["amenity"="police"](around:25000,${latitude},${longitude});
+  nwr["office"="government"]["government"="police"](around:25000,${latitude},${longitude});
+);
+out center tags;
+`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": "EbookPc/1.0 (EbookPc safety resources)"
+    },
+    body: `data=${encodeURIComponent(overpassQuery)}`
+  });
+
+  const contentType = response.headers.get("content-type") || "";
+  const body = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Police data service returned HTTP ${response.status}`
+    );
+  }
+
+  if (!contentType.toLowerCase().includes("json")) {
+    throw new Error(
+      `Police data service returned ${contentType || "non-JSON"}`
+    );
+  }
+
+  let data;
+
+  try {
+    data = JSON.parse(body);
+  } catch {
+    throw new Error("Police data service returned invalid JSON.");
+  }
+
+  return data.elements || [];
 }
 
 /* -------------------------------------------------------
@@ -119,7 +216,7 @@ app.post("/api/ai-helper", async (req, res) => {
 
 /* -------------------------------------------------------
    FIND LOCAL POLICE
-   Area + ZIP -> ZIP coordinates -> nearby police
+   Area + ZIP -> coordinates -> nearest mapped police resource
 ------------------------------------------------------- */
 
 app.post("/api/police-lookup", async (req, res) => {
@@ -138,91 +235,48 @@ app.post("/api/police-lookup", async (req, res) => {
       });
     }
 
-    /*
-      First find the ZIP/location.
-
-      We include the user's area and ZIP so the result is
-      specifically targeted to the United States location.
-    */
-
-    const geocodeUrl =
-      "https://nominatim.openstreetmap.org/search?" +
-      new URLSearchParams({
-        q: `${area}, ${zipCode}, USA`,
-        format: "jsonv2",
-        addressdetails: "1",
-        limit: "1",
-        countrycodes: "us"
-      }).toString();
-
-    const locations = await fetchJson(geocodeUrl, {
-      headers: {
-        "User-Agent": "EbookPc/1.0 contact@ebookpc.com"
-      }
-    });
-
-    if (!locations || locations.length === 0) {
-      return res.status(404).json({
-        error: "We could not find that ZIP code and area."
-      });
-    }
-
-    const latitude = Number(locations[0].lat);
-    const longitude = Number(locations[0].lon);
-
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
-      return res.status(500).json({
-        error: "The location could not be determined."
-      });
-    }
-
-    /*
-      Search nearby police locations.
-
-      25 km radius gives us enough coverage around the ZIP.
-    */
-
-    const overpassQuery = `
-[out:json][timeout:20];
-
-(
-  node["amenity"="police"](around:25000,${latitude},${longitude});
-  way["amenity"="police"](around:25000,${latitude},${longitude});
-  relation["amenity"="police"](around:25000,${latitude},${longitude});
-);
-
-out center tags;
-`;
-
-    const overpassResponse = await fetch(
-      "https://overpass-api.de/api/interpreter",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent": "EbookPc/1.0"
-        },
-        body: `data=${encodeURIComponent(overpassQuery)}`
-      }
+    const { latitude, longitude } = await geocodeUSLocation(
+      area.trim(),
+      String(zipCode)
     );
 
-    if (!overpassResponse.ok) {
-      throw new Error(
-        `Police data request failed with status ${overpassResponse.status}`
-      );
+    const endpoints = [
+      "https://overpass.private.coffee/api/interpreter",
+      "https://overpass-api.de/api/interpreter"
+    ];
+
+    let elements = [];
+    let lastError = null;
+
+    for (const endpoint of endpoints) {
+      try {
+        elements = await getPoliceFromOverpass(
+          endpoint,
+          latitude,
+          longitude
+        );
+
+        if (elements.length > 0) {
+          break;
+        }
+      } catch (error) {
+        lastError = error;
+
+        console.error(
+          `Police provider failed (${endpoint}):`,
+          error.message
+        );
+      }
     }
 
-    const policeData = await overpassResponse.json();
+    if (elements.length === 0 && lastError) {
+      throw lastError;
+    }
 
-    const policePlaces = (policeData.elements || [])
+    const policePlaces = elements
       .map((place) => {
-        const lat = Number(
-          place.lat ?? place.center?.lat
-        );
-
-        const lon = Number(
-          place.lon ?? place.center?.lon
-        );
+        const lat = Number(place.lat ?? place.center?.lat);
+        const lon = Number(place.lon ?? place.center?.lon);
 
         if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
           return null;
@@ -239,6 +293,7 @@ out center tags;
 
         const street = tags["addr:street"];
         const houseNumber = tags["addr:housenumber"];
+
         const city =
           tags["addr:city"] ||
           tags["addr:town"] ||
@@ -285,7 +340,7 @@ out center tags;
     if (policePlaces.length === 0) {
       return res.status(404).json({
         error:
-          "We could not find a police department in the nearby area."
+          "We could not find a nearby police department for this ZIP code."
       });
     }
 
@@ -296,15 +351,11 @@ out center tags;
         name: nearest.name,
         phone: nearest.phone || "Phone number not listed",
         address:
-          nearest.address ||
-          "Address not listed",
+          nearest.address || "Address not listed",
         website: nearest.website || "",
-        distance:
-          nearest.distance < 1
-            ? `${nearest.distance.toFixed(1)} miles away`
-            : `${nearest.distance.toFixed(1)} miles away`,
+        distance: `${nearest.distance.toFixed(1)} miles away`,
         note:
-          "Police information is provided from publicly available location data. Please confirm the department's phone number and address before calling. For emergencies, always call 911."
+          "This result is based on publicly available police-location data. Confirm the department's phone number and address before calling. For emergencies, always call 911."
       }
     });
   } catch (error) {
@@ -346,22 +397,50 @@ app.post("/api/bank-contact", async (req, res) => {
     }
 
     /*
-      FDIC BankFind provides publicly available
-      financial institution information.
+      FDIC uses ElasticSearch-style filters.
+      We first try a phrase search, then a simpler
+      token search so inputs like "Chase bank" can
+      match "JPMorgan Chase Bank, N.A."
     */
 
-    const fdicUrl =
-      "https://api.fdic.gov/banks/institutions?" +
-      new URLSearchParams({
-        filters: `NAME:"${cleanedBankName}"`,
-        fields:
-          "NAME,CITY,STNAME,STALP,ZIP,MAIN_PHONE,WEBADDR",
-        limit: "10"
-      }).toString();
+    const searchFilters = [
+      `NAME:"${cleanedBankName}"`,
+      `NAME:${cleanedBankName.replace(/\s+/g, " AND NAME:")}`
+    ];
 
-    const bankData = await fetchJson(fdicUrl);
+    let banks = [];
 
-    const banks = bankData.data || [];
+    for (const filter of searchFilters) {
+      const fdicUrl =
+        "https://api.fdic.gov/banks/institutions?" +
+        new URLSearchParams({
+          filters: filter,
+          fields:
+            "NAME,CITY,STNAME,STALP,ZIP,MAIN_PHONE,WEBADDR",
+          limit: "25"
+        }).toString();
+
+      try {
+        const bankData = await fetchJson(fdicUrl, {
+          headers: {
+            Accept: "application/json"
+          }
+        });
+
+        banks = Array.isArray(bankData.data)
+          ? bankData.data
+          : [];
+
+        if (banks.length > 0) {
+          break;
+        }
+      } catch (error) {
+        console.error(
+          "FDIC search attempt failed:",
+          error.message
+        );
+      }
+    }
 
     if (banks.length === 0) {
       return res.status(404).json({
@@ -370,7 +449,38 @@ app.post("/api/bank-contact", async (req, res) => {
       });
     }
 
-    const bank = banks[0];
+    const normalizedInput = cleanedBankName
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter(
+        (word) =>
+          word &&
+          !["bank", "the", "na", "n", "a"].includes(word)
+      );
+
+    const scoredBanks = banks
+      .map((bank) => {
+        const bankText = String(
+          bank.NAME || ""
+        ).toLowerCase();
+
+        const score = normalizedInput.reduce(
+          (total, word) =>
+            total + (bankText.includes(word) ? 1 : 0),
+          0
+        );
+
+        return {
+          bank,
+          score
+        };
+      })
+      .sort(
+        (a, b) => b.score - a.score
+      );
+
+    const bank = scoredBanks[0].bank;
 
     const addressParts = [
       bank.CITY,
@@ -380,15 +490,17 @@ app.post("/api/bank-contact", async (req, res) => {
 
     let website = bank.WEBADDR || "";
 
-    if (website && !/^https?:\/\//i.test(website)) {
+    if (
+      website &&
+      !/^https?:\/\//i.test(website)
+    ) {
       website = `https://${website}`;
     }
 
     res.json({
       result: {
         name:
-          bank.NAME ||
-          cleanedBankName,
+          bank.NAME || cleanedBankName,
 
         phone:
           bank.MAIN_PHONE ||
@@ -402,7 +514,7 @@ app.post("/api/bank-contact", async (req, res) => {
         website,
 
         note:
-          "Before calling, compare the number with the number printed on the back of your card or shown on an official bank statement. Never share your PIN, password or OTP."
+          "This is the bank's main phone number from FDIC public data. Before calling, compare it with the number printed on the back of your card or shown on an official bank statement. Never share your PIN, password or OTP."
       }
     });
   } catch (error) {
